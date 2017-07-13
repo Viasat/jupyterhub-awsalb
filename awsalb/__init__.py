@@ -151,8 +151,27 @@ class AwsAlb(Proxy):
         self._next_priority = len(rules['Rules']) + 1
         return self._next_priority
 
+    @gen.coroutine
     def get_all_routes(self):
-        raise NotImplementedError()
+        s3 = self._aws.client('s3')
+        resp = s3.list_objects_v2(Bucket=self.s3_bucket, Prefix=self.s3_prefix)
+
+        all_routes = {}
+        for route in resp['Contents']:
+            routespec = route['Key'].replace(self.s3_prefix, '')
+            all_routes[routespec] = self.get_route(routespec)
+        return all_routes
+
+    @gen.coroutine
+    def get_route(self, routespec):
+        s3 = self._aws.client('s3')
+        resp = s3.get_object(
+            Bucket=self.s3_bucket, os.path.join(self.s3_prefix, routespec))
+        try:
+            return resp['Body'].read()
+        except KeyError:
+            self.log.warning('No route was found for %s.' % routespec)
+            return {}
 
     @gen.coroutine
     def add_route(self, routespec, target, data):
