@@ -4,6 +4,7 @@ A Jupyterhub Proxy plugin to use AWS Application Load Balancer to proxy to spawn
 
 from __future__ import print_function
 
+import json
 import ipaddress
 
 import hvac
@@ -41,8 +42,6 @@ class AwsAlb(Proxy):
     each route. By default this tag is called jupyterhub
     """
 
-    should_start = False
-
     # TODO: Remove need for Vault but still support STS tokens.
     use_vault = Bool(False, help="Use hashicorp vault to get AWS STS tokens.", config=True)
     vault_url = Unicode(help="The URL to access Hashicorp Vault.", config=True)
@@ -54,6 +53,13 @@ class AwsAlb(Proxy):
         help="Do the spawned instances listen on HTTP or HTTPS. Defaults to HTTPS", config=True)
     alb_vpcid = Unicode(help="The VPC identifier the spawned instances get spawned in.", config=True)
     alb_hub_tag = Unicode(help="The tag to use to store data for this hub.", config=True)
+    alb_cert_arn = Unicode(help="The certificat ARN if starting an HTTPS listener.", config=True)
+    alb_listener_protocol = Unicode(help="The protocol the listener listens on. HTTP|HTTPS", config=True)
+    alb_scheme = Unicode(help="The scheme for the ALB. Valid options = internal|internet-facing", config=True)
+    alb_tags = Dict(help="Set of tags to apply to ALB on creation.", config=True)
+    alb_security_groups = List(help="The security groups to assign to the created ALB.", config=True)
+    alb_subnets = List(Help="The subnets to assign to the created ALB.", config=True)
+    alb_ipaddress_type = Unicode(help="The IpAddressType for the created ALB.", config=True)
 
     simple_db_domain = Unicode(help="SimpleDB domain to store metadata in.", config=True)
     s3_bucket = Unicode(help="S3 bucket to store metadata about routes in.", config=True)
@@ -152,6 +158,85 @@ class AwsAlb(Proxy):
         return self._next_priority
 
     @gen.coroutine
+    def start(self):
+        client = get_aws_client(vault, 'elbv2')
+
+        # First check if load balancer exists
+        lbs = client.describe_load_balancers()
+        should_create_alb = True
+        for lb in lbs['LoadBalancers']:
+            if lb['LoadBalancerName'] == self.alb_name:
+                self._alb_arn = lb['LoadBalancerArn']
+                self.vpcid = lb['VpcId']
+                should_create_alb = False
+
+        if should_create_alb:
+            resp = client.create_load_balancer(
+                Name=self.alb_name, Subnets=self.alb_subnets, SecurityGroups=self.alb_security_groups,
+                Scheme=self.alb_scheme, Tags=self.alb_tags, IpAddressType=self.alb_ipaddress_type
+            )
+
+            alb_found = False
+            for lb in resp['LoadBalancers']:
+                if lb['LoadBalancerName'] == alb_name:
+                    alb_found = True
+                    self._alb_arn = lb['LoadBalancerArn']
+                    self.vpcid = lb['VpcId']
+
+            if not alb_found:
+                raise RuntimeError('FAILED to create ALB: %s' % json.dumps(resp))
+
+        should_create_listener = True
+        listeners = client.describe_listeners(LoadBalancerArn=self.alb_arn)
+        for lner in listeners:
+            if lner['Protocol'] == self.alb_listener_protocol and lner['Port'] == self.alb_listener_port:
+                self._listener_arn = lner['ListenerArn']
+                should_create_listener = False
+
+        if should_create_listener:
+            create_listener_args = {
+                'LoadBalancerArn': self.alb_arn,
+                'Protocol': self.alb_listener_protocol,
+                'Port': self.alb_listener_port,
+            }
+            if self.alb_cert_arn:
+                create_listener_args.update({
+                    'Certificates': [{'CertificateArn': self.alb_cert_arn}],
+                })
+            listeners = client.create_listener(**create_listener_args)
+            listener_found = False
+            for lner in listeners['Listeners']:
+                if lner['LoadBalancerArn'] == self.alb_arn:
+                    self._listener_arn = lner['ListenerArn']
+                    listener_found = True
+            if not listener_found:
+                raise RuntimeError('Failed to create listener on ALB: %s', json.dumps(listeners))
+
+        tg_arn = self._create_target_group('hub', 'HTTP', self.alb_listener_port, self.vpcid, '/api')
+
+        # lookup our instance-id
+        httpclient = AsyncHTTPClient()
+        self.log.debug(": Fetching %s %s", method, url)
+        req = HTTPRequest('http://169.254.169.254/latest/meta-data/instance-id', method='GET')
+        resp = yield httpclient.fetch(req)
+        instance_id = resp.body.decode('utf8')
+
+        target = elbv2.register_target(TargetGroupArn=tg_arn, Targets=[{'Id': instance_id}])
+
+        rule = elbv2.create_rule(ListenerArn=self.listener_arn,
+                                 Conditions=[{'Field': 'path-pattern', 'Values': ['/hub']}],
+                                 Priority=1,
+                                 Actions=[{'Type': 'forward', 'TargetGroupArn': tg_arn}])
+
+    @gen.coroutine
+    def stop(self):
+        for routespec in self.get_all_routes():
+            self.delete_route(routespec)
+
+        elbv2 = self_aws.client('elbv2')
+        elbv2.delete_load_balancer(LoadBalancerArn=self.alb_arn)
+
+    @gen.coroutine
     def get_all_routes(self):
         s3 = self._aws.client('s3')
         resp = s3.list_objects_v2(Bucket=self.s3_bucket, Prefix=self.s3_prefix)
@@ -173,23 +258,11 @@ class AwsAlb(Proxy):
             self.log.warning('No route was found for %s.' % routespec)
             return {}
 
-    @gen.coroutine
-    def add_route(self, routespec, target, data):
-        path = self.validate_routespec(routespec)
-
-        # We use a uuid for the target group name because
-        # target group names have a limit of 32 alphanumeric charaters.
-        # routespec is close enough to a url
-        target_group_name = uuid.uuid5(uuid.NAMESPACE_URL, routespec)
-
-        # need to extract the target port from target
-        target_url = urlparse(target)
-
+    def _create_target_group(self, tg_name, proto, port, vpcid, hc_path):
         elbv2 = self._aws.client('elbv2')
-
         # Create Target Group
         target_group = elbv2.create_target_group(
-            Name=target_group_name,
+            Name=tg_name,
             Protocol=target_url.scheme,
             Port=target_url.port,
             VpcId=self.vpcid,
@@ -201,6 +274,29 @@ class AwsAlb(Proxy):
             raise RuntimeError('Failed to create the target group: %s, routespec: %s.' % target_group_name, routespec)
         except KeyError:
             raise RuntimeError('Failed to retreive TargetGroupArn from response. %s.' % str(target_group))
+
+        return tg_arn
+
+    @gen.coroutine
+    def add_route(self, routespec, target, data):
+        path = self.validate_routespec(routespec)
+
+        # We use a uuid for the target group name because
+        # target group names have a limit of 32 alphanumeric charaters.
+        # routespec is close enough to a url
+        tg_name = uuid.uuid5(uuid.NAMESPACE_URL, routespec)
+        # need to extract the target port from target
+        target_url = urlparse(target)
+
+        tg_arn = self._create_target_group(tg_name,
+                                           target_url.scheme,
+                                           target_url.port,
+                                           self.vpcid,
+                                           "/api/status")
+
+
+        elbv2 = self._aws.client('elbv2')
+
 
         # Add target to target group
         instance_id = self.get_instance_id(target)
