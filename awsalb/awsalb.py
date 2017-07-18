@@ -7,7 +7,6 @@ A Jupyterhub Proxy plugin to use AWS Application Load Balancer to proxy to spawn
 
 from __future__ import print_function
 
-import os
 import json
 import uuid
 import ipaddress
@@ -23,7 +22,7 @@ from tornado.httpclient import AsyncHTTPClient, HTTPRequest
 
 from botocore.exceptions import ClientError
 
-from traitlets import Any, Bool, Instance, Integer, Unicode, List
+from traitlets import Bool, Integer, Unicode, List
 
 from jupyterhub.proxy import Proxy
 # from jupyterhub.traitlets import Command
@@ -436,8 +435,13 @@ class AwsAlb(Proxy):
         elbv2 = self._aws.client('elbv2')
 
         tg_name = uuid.uuid5(uuid.NAMESPACE_URL, self.alb_name + '/' + routespec).hex
-        tg_desc = elbv2.describe_target_groups(Names=[tg_name])
-        tg_arn = tg_desc['TargetGroups'][0]['TargetGroupArn']
+        tg_arn = None
+        try:
+            tg_desc = elbv2.describe_target_groups(Names=[tg_name])
+            tg_arn = tg_desc['TargetGroups'][0]['TargetGroupArn']
+        except ClientError as err:
+            if err.response['Error']['Code'] != 'TargetGroupNotFound':
+                raise
 
         rules = elbv2.describe_rules(ListenerArn=self.listener_arn)
         rule_arn = ''
@@ -447,10 +451,8 @@ class AwsAlb(Proxy):
                     rule_arn = rule['RuleArn']
                     elbv2.delete_rule(RuleArn=rule_arn)
 
-        try:
+        if tg_arn:
             elbv2.delete_target_group(TargetGroupArn=tg_arn)
-        except ClientError:
-            pass
 
         try:
             self._aws.client('s3').delete_object(
