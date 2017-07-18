@@ -252,7 +252,8 @@ class AwsAlb(Proxy):
 
     @gen.coroutine
     def stop(self):
-        for routespec in self.get_all_routes():
+        routes = yield self.get_all_routes()
+        for routespec in routes:
             self.delete_route(routespec)
 
         elbv2 = self._aws.client('elbv2')
