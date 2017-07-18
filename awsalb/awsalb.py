@@ -2,6 +2,9 @@
 A Jupyterhub Proxy plugin to use AWS Application Load Balancer to proxy to spawned notebook servers.
 """
 
+# Copyright (c) ViaSat, Inc.
+# Distributed under the terms of the BSD-3-Clause License
+
 from __future__ import print_function
 
 import os
