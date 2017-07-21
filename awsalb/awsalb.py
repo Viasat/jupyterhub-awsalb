@@ -449,9 +449,11 @@ class AwsAlb(Proxy):
             for action in rule['Actions']:
                 if action.get('TargetGroupArn') == tg_arn:
                     rule_arn = rule['RuleArn']
-                    elbv2.delete_rule(RuleArn=rule_arn)
+                    self.log.info('Deleting rule for routespec %s and route arn %s', routespec, rule_arn)
+                    elbv2.delete_rule(RuleArn=rule['RuleArn'])
 
         if tg_arn:
+            self.log.info('Deleting target group routespec=%s tg_arn=%s', routespec, tg_arn)
             elbv2.delete_target_group(TargetGroupArn=tg_arn)
 
         try:
