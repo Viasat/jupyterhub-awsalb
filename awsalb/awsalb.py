@@ -15,9 +15,11 @@ import hvac
 import boto3
 
 from urllib.parse import urlparse
+from concurrent.futures import ThreadPoolExecutor
 
 from tornado import gen
-from tornado.ioloop import PeriodicCallback
+from tornado.concurrent import run_on_executor
+from tornado.ioloop import PeriodicCallback, IOLoop
 from tornado.httpclient import AsyncHTTPClient, HTTPRequest
 
 from botocore.exceptions import ClientError
@@ -58,23 +60,31 @@ class AwsAlb(Proxy):
 
     alb_name = Unicode(help="The name of the Application Load Balancer.", config=True)
     alb_target_protocol = Unicode(
-        help="Do the spawned instances listen on HTTP or HTTPS.", config=True)
-    # alb_vpcid = Unicode(help="The VPC identifier the spawned instances get spawned in.", config=True)
+        "HTTP", help="Do the spawned instances listen on HTTP or HTTPS.", config=True)
     alb_region = Unicode(help="The region the hub is located in.", config=True)
     alb_cert_arn = Unicode(help="The certificat ARN if starting an HTTPS listener.", config=True)
-    alb_listener_protocol = Unicode(help="The protocol the listener listens on. HTTP|HTTPS", config=True)
-    alb_listener_port = Integer(help="The port the listener listens on.", config=True)
-    alb_scheme = Unicode(help="The scheme for the ALB. Valid options = internal|internet-facing", config=True)
+    alb_listener_protocol = Unicode("HTTP", help="The protocol the listener listens on. HTTP|HTTPS", config=True)
+    alb_listener_port = Integer(80, help="The port the listener listens on.", config=True)
+    alb_scheme = Unicode("internal", help="The scheme for the ALB. Valid options = internal|internet-facing", config=True)
     alb_tags = List(help="Set of tags to apply to ALB on creation.", config=True)
     alb_security_groups = List(help="The security groups to assign to the created ALB.", config=True)
     alb_subnets = List(Help="The subnets to assign to the created ALB.", config=True)
-    alb_ipaddress_type = Unicode(help="The IpAddressType for the created ALB.", config=True)
+    alb_ipaddress_type = Unicode("ipv4", help="The IpAddressType for the created ALB.", config=True)
+
+    tg_healthcheck_interval = Integer(30, help="Interval for ALB to run its health check.", config=True)
+    tg_healthcheck_timeout = Integer(5, help="Timeout for ALB to fail its health check.", config=True)
+    tg_healthy_threshold = Integer(
+        5, help="Number of health checks that need to pass before target is considered health.", config=True)
+    tg_unhealthy_threshold = Integer(
+        2, help="Number of health checks that need to fail before target is considered unhealth.", config=True)
 
     s3_bucket = Unicode(help="S3 bucket to store metadata about routes in.", config=True)
     s3_prefix = Unicode(help="Prefix to store objects in S3 bucket at.", config=True)
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+
+        self.executor = ThreadPoolExecutor(max_workers=8)
 
         if self.s3_prefix[0] == '/':
             self.s3_prefix = self.s3_prefix[1:]
@@ -115,6 +125,12 @@ class AwsAlb(Proxy):
             aws_session_token=token['data']['security_token'])
         return token
 
+    # Turn sync code into async.
+    # Idea from https://github.com/jupyterhub/kubespawner/blob/b6883cbc68eba4b9d69aa86066739b73732ed970/kubespawner/proxy.py#L67
+    @run_on_executor
+    def asynchronize(self, method, *args, **kwargs):
+        return method(*args, **kwargs)
+
     @property
     def alb_arn(self):
         if hasattr(self, '_alb_arn') and self._alb_arn != '':
@@ -140,6 +156,7 @@ class AwsAlb(Proxy):
         except IndexError:
             raise RuntimeError("Could not find a Listener associated with the ALB %s.", self.alb_name)
 
+    @gen.coroutine
     def get_instance_id(self, target):
         url = urlparse(target)
         try:
@@ -149,7 +166,8 @@ class AwsAlb(Proxy):
 
         # assume ipaddress is private_ipv4
         client = self._aws.client('ec2')
-        resp = client.describe_instances(
+        resp = yield self.asynchronize(
+            client.describe_instances,
             Filters=[{'Name': 'private-ip-address', 'Values': [url.hostname]}],
         )
 
@@ -169,17 +187,6 @@ class AwsAlb(Proxy):
             if limit['Name'] == 'rules-per-application-load-balancer':
                 self._max_rules = int(limit['Max'])
         return self._max_rules
-
-    @property
-    def next_priority(self):
-        if hasattr(self, '_next_priority'):
-            self._next_priority -= 1
-            return self._next_priority
-
-        client = self._aws.client('elbv2')
-        rules = client.describe_rules(ListenerArn=self.listener_arn)
-        self._next_priority = 100 - len(rules['Rules']) + 1
-        return self._next_priority
 
     @gen.coroutine
     def start(self):
@@ -213,7 +220,7 @@ class AwsAlb(Proxy):
                 raise RuntimeError('FAILED to create ALB: %s' % json.dumps(resp))
 
         tg_name = uuid.uuid5(uuid.NAMESPACE_URL, self.alb_name + '/').hex
-        tg_arn = self._create_target_group(tg_name, 'HTTP', self.hub.port, self.vpcid, '/hub/api')
+        tg_arn = yield self._create_target_group(tg_name, 'HTTP', self.hub.port, self.vpcid, '/hub/api')
 
         should_create_listener = True
         listeners = client.describe_listeners(LoadBalancerArn=self.alb_arn)
@@ -258,13 +265,22 @@ class AwsAlb(Proxy):
         for routespec in routes:
             self.delete_route(routespec)
 
-        elbv2 = self._aws.client('elbv2')
-        elbv2.delete_load_balancer(LoadBalancerArn=self.alb_arn)
+        client = self._aws.client('elbv2')
+        client.delete_load_balancer(LoadBalancerArn=self.alb_arn)
+
+        try:
+            self._aws.client('s3').delete_object(
+                Bucket=self.s3_bucket,
+                Key=self.s3_prefix + '/' + 'metadata'
+            )
+        except ClientError as err:
+            if err.response['Error']['Code'] != 'NoSuchKey':
+                raise
 
     @gen.coroutine
     def get_all_routes(self):
         s3 = self._aws.client('s3')
-        resp = s3.list_objects_v2(Bucket=self.s3_bucket, Prefix=self.s3_prefix)
+        resp = yield self.asynchronize(s3.list_objects_v2, Bucket=self.s3_bucket, Prefix=self.s3_prefix)
 
         all_routes = {}
         if resp['KeyCount'] > 0:
@@ -286,7 +302,8 @@ class AwsAlb(Proxy):
 
         s3 = self._aws.client('s3')
         try:
-            resp = s3.get_object(
+            resp = yield self.asynchronize(
+                s3.get_object,
                 Bucket=self.s3_bucket,
                 Key=self.s3_prefix + routespec + 'metadata'
             )
@@ -297,13 +314,14 @@ class AwsAlb(Proxy):
             self.log.warning('No route was found for "%s".' % routespec)
             return {}
 
+    @gen.coroutine
     def _create_target_group(self, tg_name, proto, port, vpcid, hc_path):
         client = self._aws.client('elbv2')
 
         tg_arn = None
         # First check if target group exists
         try:
-            tgs = client.describe_target_groups(Names=[tg_name])
+            tgs = yield self.asynchronize(client.describe_target_groups, Names=[tg_name])
             for tg in tgs['TargetGroups']:
                 if tg['TargetGroupName'] == tg_name:
                     tg_arn = tg['TargetGroupArn']
@@ -313,12 +331,18 @@ class AwsAlb(Proxy):
             if err.response['Error']['Code'] != 'TargetGroupNotFound':
                 raise
 
-        tgs = client.create_target_group(
+        tgs = yield self.asynchronize(
+            client.create_target_group,
             Name=tg_name,
             Protocol=proto,
             Port=port,
             VpcId=self.vpcid,
-            HealthCheckPath=hc_path)
+            HealthCheckPath=hc_path,
+            HealthCheckIntervalSeconds=self.tg_healthcheck_interval,
+            HealthCheckTimeoutSeconds=self.tg_healthcheck_timeout,
+            HealthyThresholdCount=self.tg_healthy_threshold,
+            UnhealthyThresholdCount=self.tg_unhealthy_threshold,
+        )
 
         for tg in tgs['TargetGroups']:
             if tg['TargetGroupName'] == tg_name:
@@ -349,28 +373,31 @@ class AwsAlb(Proxy):
         if data.get('user'):
             hc_path = '/user/%s/api' % data['user']
 
-        tg_arn = self._create_target_group(tg_name,
-                                           target_url.scheme.upper(),
-                                           target_url.port,
-                                           self.vpcid,
-                                           hc_path)
-
-        # Add target to target group
-        instance_id = self.get_instance_id(target)
+        tg_arn = yield self._create_target_group(tg_name,
+                                                 target_url.scheme.upper(),
+                                                 target_url.port,
+                                                 self.vpcid,
+                                                 hc_path)
 
         client = self._aws.client('elbv2')
+
+        # Add target to target group
+        instance_id = yield self.get_instance_id(target)
+
         # See if there are existing targets in target group,
         # and deregister them if they do not match.
-        targets = client.describe_target_health(TargetGroupArn=tg_arn)
+        targets = yield self.asynchronize(client.describe_target_health, TargetGroupArn=tg_arn)
         for target in targets['TargetHealthDescriptions']:
             if (target['Target']['Id'] != instance_id or
                     target['Target']['Port'] != target_url.port):
-                client.deregister_targets(
+                yield self.asynchronize(
+                    client.deregister_targets,
                     TargetGroupArn=tg_arn,
                     Targets=[target['Target']]
                 )
 
-        target = client.register_targets(
+        target = yield self.asynchronize(
+            client.register_targets,
             TargetGroupArn=tg_arn,
             Targets=[{'Id': instance_id, 'Port': target_url.port}]
         )
@@ -384,7 +411,7 @@ class AwsAlb(Proxy):
         self.log.info('Adding rule to route to %s based on condition %s.', tg_arn, json.dumps(condition))
 
         min_priority = MAX_PRIORITY + 1
-        rules = client.describe_rules(ListenerArn=self.listener_arn)
+        rules = yield self.asynchronize(client.describe_rules, ListenerArn=self.listener_arn)
         exists = False
         for rule in rules['Rules']:
             try:
@@ -405,7 +432,8 @@ class AwsAlb(Proxy):
                             self.log.debug('Checking existing condition path "%s" == "%s"', type(path), type(condition['Values'][0]))
                             if path not in condition['Values']:
                                 self.log.debug('Modifying rule %s', rule['RuleArn'])
-                                client.modify_rule(
+                                yield self.asynchronize(
+                                    client.modify_rule,
                                     RuleArn=rule['RuleArn'],
                                     Conditions=[condition],
                                     Actions=rule['Actions']
@@ -414,7 +442,8 @@ class AwsAlb(Proxy):
                                 self.log.debug('Rule %s already matches.', rule['RuleArn'])
 
         if not exists:
-            client.create_rule(
+            yield self.asynchronize(
+                client.create_rule,
                 ListenerArn=self.listener_arn,
                 Conditions=[condition],
                 Priority=min_priority - 1,
@@ -424,40 +453,56 @@ class AwsAlb(Proxy):
         # Save metadata to S3
 
         metadata.update({'jupyterhub-route': True})
-        self._aws.client('s3').put_object(
+        yield self.asynchronize(
+            self._aws.client('s3').put_object,
             Body=json.dumps(metadata).encode('utf8'),
             Bucket=self.s3_bucket,
             Key=self.s3_prefix + routespec + 'metadata'
         )
 
+        # Need to wait for target to be healthy.
+        starttime = IOLoop.current().time()
+        while IOLoop.current().time() < starttime + (self.tg_healthcheck_interval * self.tg_healthy_threshold * 2):
+            targets = yield self.asynchronize(client.describe_target_health, TargetGroupArn=tg_arn)
+            for target in targets['TargetHealthDescriptions']:
+                target_state = target['TargetHealth']['State']
+                if target_state == 'healthy':
+                    return
+                elif target_state == 'initial':
+                    self.log.debug('Route to routespec %s initializing. %s', routespec, target['TargetHealth']['Reason'])
+                    yield gen.sleep(30)
+                elif target_state == 'unhealthy':
+                    self.log.error('Route to routespec %s failed. Target is unhealth: %s', routespec, target['TargetHealth']['Reason'])
+
     @gen.coroutine
     def delete_route(self, routespec):
-        elbv2 = self._aws.client('elbv2')
+        client = self._aws.client('elbv2')
 
         tg_name = uuid.uuid5(uuid.NAMESPACE_URL, self.alb_name + '/' + routespec).hex
         tg_arn = None
         try:
-            tg_desc = elbv2.describe_target_groups(Names=[tg_name])
+            tg_desc = yield self.asynchronize(client.describe_target_groups, Names=[tg_name])
             tg_arn = tg_desc['TargetGroups'][0]['TargetGroupArn']
         except ClientError as err:
             if err.response['Error']['Code'] != 'TargetGroupNotFound':
                 raise
 
-        rules = elbv2.describe_rules(ListenerArn=self.listener_arn)
+        rules = yield self.asynchronize(client.describe_rules, ListenerArn=self.listener_arn)
         rule_arn = ''
         for rule in rules['Rules']:
             for action in rule['Actions']:
                 if action.get('TargetGroupArn') == tg_arn:
                     rule_arn = rule['RuleArn']
                     self.log.info('Deleting rule for routespec %s and route arn %s', routespec, rule_arn)
-                    elbv2.delete_rule(RuleArn=rule['RuleArn'])
+                    yield self.asynchronize(client.delete_rule, RuleArn=rule['RuleArn'])
 
         if tg_arn:
             self.log.info('Deleting target group routespec=%s tg_arn=%s', routespec, tg_arn)
-            elbv2.delete_target_group(TargetGroupArn=tg_arn)
+            yield self.asynchronize(client.delete_target_group, TargetGroupArn=tg_arn)
 
         try:
-            self._aws.client('s3').delete_object(
+            yield self.asynchronize(
+                self._aws.client('s3').delete_object,
                 Bucket=self.s3_bucket,
                 Key=self.s3_prefix + routespec + 'metadata'
             )
