@@ -102,7 +102,7 @@ class AwsAlb(Proxy):
             self._renew_vault_token()
 
             # renew 20 mins before token expires
-            period = (token['data']['creation_ttl'] - 1200) * 1000
+            period = (token['data']['ttl'] - 1200) * 1000
             pc = PeriodicCallback(self._renew_vault_token, period)
             pc.start()
 
@@ -155,6 +155,9 @@ class AwsAlb(Proxy):
             return listeners[0]['ListenerArn']
         except IndexError:
             raise RuntimeError("Could not find a Listener associated with the ALB %s.", self.alb_name)
+
+    def gen_tg_name(self, routespec):
+        return uuid.uuid5(uuid.NAMESPACE_URL, self.alb_name + routespec).hex
 
     @gen.coroutine
     def get_instance_id(self, target):
@@ -219,7 +222,7 @@ class AwsAlb(Proxy):
             if not alb_found:
                 raise RuntimeError('FAILED to create ALB: %s' % json.dumps(resp))
 
-        tg_name = uuid.uuid5(uuid.NAMESPACE_URL, self.alb_name + '/').hex
+        tg_name = self.gen_tg_name('/')
         tg_arn = yield self._create_target_group(tg_name, 'HTTP', self.hub.port, self.vpcid, '/hub/api')
 
         should_create_listener = True
@@ -366,7 +369,7 @@ class AwsAlb(Proxy):
         # We use a uuid for the target group name because
         # target group names have a limit of 32 alphanumeric charaters.
         # routespec is close enough to a url
-        tg_name = uuid.uuid5(uuid.NAMESPACE_URL, self.alb_name + routespec).hex
+        tg_name = self.gen_tg_name(routespec)
         # need to extract the target port from target
         target_url = urlparse(target)
 
@@ -478,7 +481,8 @@ class AwsAlb(Proxy):
     def delete_route(self, routespec):
         client = self._aws.client('elbv2')
 
-        tg_name = uuid.uuid5(uuid.NAMESPACE_URL, self.alb_name + '/' + routespec).hex
+        tg_name = self.gen_tg_name(routespec)
+        self.log.info('Deleting rule for routespec %s to target group %s', routespec, tg_name)
         tg_arn = None
         try:
             tg_desc = yield self.asynchronize(client.describe_target_groups, Names=[tg_name])
