@@ -57,6 +57,7 @@ class AwsAlb(Proxy):
     vault_url = Unicode(help="The URL to access Hashicorp Vault.", config=True)
     vault_token = Unicode(help="The Hashicorp Vault auth token.", config=True)
     vault_path = Unicode(help="The path to request STS tokens from Vault.", config=True)
+    vault_args = Dict(help="Extra args to pass to vault constructor", default_value={}, config=True)
 
     alb_name = Unicode(help="The name of the Application Load Balancer.", config=True)
     alb_target_protocol = Unicode(
@@ -93,7 +94,7 @@ class AwsAlb(Proxy):
 
         if self.use_vault:
             self.vault = hvac.Client(url=self.vault_url,
-                                     token=self.vault_token)
+                                 token=self.vault_token, **self.vault_args)
             try:
                 token = self.vault.lookup_token()
             except hvac.exceptions.Forbidden:
