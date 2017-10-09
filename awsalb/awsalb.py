@@ -24,7 +24,7 @@ from tornado.httpclient import AsyncHTTPClient, HTTPRequest
 
 from botocore.exceptions import ClientError
 
-from traitlets import Bool, Integer, Unicode, List
+from traitlets import Bool, Integer, Unicode, List, Dict
 
 from jupyterhub.proxy import Proxy
 # from jupyterhub.traitlets import Command
